@@ -1,0 +1,37 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: mso-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: mso
+      POSTGRES_PASSWORD: mso_secret
+      POSTGRES_DB: mso_wms
+    ports:
+      - "5438:5432"
+    volumes:
+      - mso_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mso -d mso_wms"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: mso-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6381:6379"
+    volumes:
+      - mso_redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  mso_pgdata:
+  mso_redisdata:

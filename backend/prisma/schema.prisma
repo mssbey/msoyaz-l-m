@@ -1,0 +1,422 @@
+// MSO Teknoloji - Merkezi Pazar Yeri Fiyatlama ve WMS Sistemi
+// Veritabani: PostgreSQL 16 (3NF normalize)
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Marketplace {
+  N11
+  HB
+  TY
+  PZRM
+  STD
+  ENY // eNyeniler (kendi magazamiz)
+}
+
+enum PricingModel {
+  /// Excel calisma kitabindaki model: fiyat, komisyon oranlariyla carpilarak bulunur.
+  EXCEL_MARKUP
+  /// Spesifikasyon V1.0: komisyon tersine hesaplanir -> fiyat = gelir / (1 - komisyon).
+  REVERSE_COMMISSION
+}
+
+enum StockMovementType {
+  WAREHOUSE_SCAN // Depo personeli barkod okuttu (-1)
+  SALE_WEBHOOK // Sentos siparis webhook'u (dijital rezerv)
+  MANUAL_ADJUST // Panelden elle duzeltme
+  SYNC_CORRECTION // 15 dakikalik stok check duzeltmesi
+  RETURN // Iade girisi
+  PURCHASE_IN // Mal kabul / satin alma girisi
+}
+
+enum SyncStatus {
+  PENDING
+  QUEUED
+  SUCCESS
+  FAILED
+  SKIPPED
+}
+
+enum WebhookStatus {
+  RECEIVED
+  PROCESSED
+  FAILED
+  DUPLICATE
+}
+
+/// Sistemin global degiskenleri. Tek satir tutulur (id = 1).
+model Setting {
+  id Int @id @default(1)
+
+  /// Hangi fiyat modelinin kullanilacagi
+  pricingModel PricingModel @default(EXCEL_MARKUP) @map("pricing_model")
+
+  usdExchangeRate           Decimal @default(0) @map("usd_exchange_rate") @db.Decimal(12, 4)
+  /// Excel "Karlilik %": 2 (yani x2) burada 200 olarak tutulur
+  targetProfitMarginPercent Decimal @default(200) @map("target_profit_margin_percent") @db.Decimal(8, 3)
+  /// Excel "Birim Paketleme Gideri" - maliyete kar sonrasi eklenir
+  packagingCost             Decimal @default(0) @map("packaging_cost") @db.Decimal(12, 2)
+  /// STD pazaryeri kargo baremi (pazar yeri bazli olanlar marketplace_settings icinde)
+  cargoBaremLimit           Decimal @default(300) @map("cargo_barem_limit") @db.Decimal(12, 2)
+  /// Excel "Ust Barem Kargo" - barem asildiginda uygulanan kargo
+  upperBaremCargoCost       Decimal @default(0) @map("upper_barem_cargo_cost") @db.Decimal(12, 2)
+  /// Excel "Alt Barem Kargo" - barem altinda uygulanan kargo
+  lowerBaremCargoCost       Decimal @default(0) @map("lower_barem_cargo_cost") @db.Decimal(12, 2)
+  /// Yalnizca REVERSE_COMMISSION modelinde kullanilir
+  standardCargoCost         Decimal @default(0) @map("standard_cargo_cost") @db.Decimal(12, 2)
+
+  /// Excel "eNyeniler Extra Fark" (0.1 -> %10)
+  enYenilerExtraMargin     Decimal @default(10) @map("en_yeniler_extra_margin") @db.Decimal(8, 3)
+  /// Excel "eNyeniler Extra Indirim"
+  enYenilerDiscountPercent Decimal @default(0) @map("en_yeniler_discount_percent") @db.Decimal(8, 3)
+
+  /// Excel'de kargo baremi testinde kullanilan taban carpan (1.019)
+  cargoTestBase Decimal @default(1.019) @map("cargo_test_base") @db.Decimal(8, 5)
+  /// Excel'de eNyeniler fiyatinda kullanilan taban carpan (1.018)
+  enYenilerBase Decimal @default(1.018) @map("en_yeniler_base") @db.Decimal(8, 5)
+
+  /// Fiyat yuvarlama: NONE | ROUND_2 | PSYCHOLOGICAL_99
+  priceRoundingStrategy String @default("ROUND_2") @map("price_rounding_strategy")
+
+  /// Barkod okutuldugunda stogun once dusulecegi Sentos deposu (bos ise ilk depo)
+  sentosWarehouseId Int? @map("sentos_warehouse_id")
+
+  exchangeRateSource    String?   @map("exchange_rate_source")
+  exchangeRateUpdatedAt DateTime? @map("exchange_rate_updated_at")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("settings")
+}
+
+/// Varyasyonsuz cati urun.
+model Product {
+  id              Int     @id @default(autoincrement())
+  mainProductCode String  @unique @map("main_product_code")
+  name            String
+  brand           String?
+  category        String?
+  description     String?
+  imageUrl        String? @map("image_url")
+
+  /// Sentos urun ID'si (GET/PUT /products/{id})
+  sentosProductId Int?      @unique @map("sentos_product_id")
+  sentosSyncedAt  DateTime? @map("sentos_synced_at")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  variants ProductVariant[]
+
+  @@index([brand])
+  @@index([category])
+  @@map("products")
+}
+
+/// SKU seviyesi. Barkod, stok ve fiyat hesaplamalarinin merkezi.
+model ProductVariant {
+  id        Int     @id @default(autoincrement())
+  productId Int     @map("product_id")
+  product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  variantCode     String  @unique @map("variant_code")
+  barcode         String  @unique
+  sentosStockCode String? @map("sentos_stock_code")
+  color           String?
+  size            String?
+  model           String?
+
+  /// Excel'de komisyon varyant bazinda tutulur; bos ise marketplace_commissions kullanilir.
+  commissionPercent      Decimal? @map("commission_percent") @db.Decimal(8, 4)
+  extraCommissionPercent Decimal? @map("extra_commission_percent") @db.Decimal(8, 4)
+
+  // Excel'deki maliyetlerde 5 ondalik kullanildigi icin 6 haneye kadar saklanir.
+  purchasePriceUsd Decimal @default(0) @map("purchase_price_usd") @db.Decimal(14, 6)
+  customsTaxUsd    Decimal @default(0) @map("customs_tax_usd") @db.Decimal(14, 6)
+  freightCostUsd   Decimal @default(0) @map("freight_cost_usd") @db.Decimal(14, 6)
+
+  /// Raftaki gercek fiziksel stok
+  stockQuantity Int @default(0) @map("stock_quantity")
+
+  /// Webhook ile rezerve edilmis (henuz raftan dusmemis) adet
+  reservedQuantity Int @default(0) @map("reserved_quantity")
+
+  /// Excel "% Extra ilave" (0.1 -> 10). EXCEL_MARKUP modelinde fiyati, spesifikasyon
+  /// modelinde maliyet uzerinden fire payini artirir.
+  extraLossMargin Decimal @default(0) @map("extra_loss_margin") @db.Decimal(8, 3)
+
+  /// "En Yeniler" ekstra kar payi bu varyanta uygulansin mi
+  applyEnYeniler Boolean @default(false) @map("apply_en_yeniler")
+
+  isActive Boolean @default(true) @map("is_active")
+  imageUrl String? @map("image_url")
+
+  /// Varyantin bagli oldugu Sentos urun ID'si (varyasyonsuz urunde varyant = urunun kendisi)
+  sentosProductId    Int?      @map("sentos_product_id")
+  /// Sentos'taki depo bazli stok dagilimi: [{ warehouseId, stock }]
+  warehouseStocks    Json?     @map("warehouse_stocks")
+  /// Lokalde dusulmus ama henuz Sentos'a iletilmemis stok farki (okutma: negatif)
+  pendingSentosDelta Int       @default(0) @map("pending_sentos_delta")
+  sentosSyncedAt     DateTime? @map("sentos_synced_at")
+  lastSentosError    String?   @map("last_sentos_error")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  prices     VariantPrice[]
+  movements  StockMovement[]
+  orderLines SentosOrderLine[]
+
+  @@index([sentosStockCode])
+  @@index([productId])
+  @@index([sentosProductId])
+  @@map("product_variants")
+}
+
+/// Pazar yeri + kategori bazli komisyon kesintileri.
+model MarketplaceCommission {
+  id          Int         @id @default(autoincrement())
+  marketplace Marketplace
+
+  /// Pazar yerindeki kategori kodu. "*" => o pazar yeri icin varsayilan.
+  categoryId String @default("*") @map("category_id")
+
+  commissionPercent      Decimal @default(0) @map("commission_percent") @db.Decimal(6, 2)
+  extraCommissionPercent Decimal @default(0) @map("extra_commission_percent") @db.Decimal(6, 2)
+
+  isActive Boolean @default(true) @map("is_active")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([marketplace, categoryId])
+  @@map("marketplace_commissions")
+}
+
+/// Pazar yeri bazli kargo baremi, extra fark ve piyasa fiyati carpani (Excel "MSO Ayarlar").
+model MarketplaceSetting {
+  id          Int         @id @default(autoincrement())
+  marketplace Marketplace @unique
+
+  /// Kargo baremi esigi (Excel: "N11/HB/TY/PZRM/STD Kargo Baremi")
+  cargoBaremLimit          Decimal @default(300) @map("cargo_barem_limit") @db.Decimal(12, 2)
+  /// Excel "Extra Fark" (0.03 -> 3)
+  extraFarkPercent         Decimal @default(0) @map("extra_fark_percent") @db.Decimal(8, 3)
+  /// Excel "Piyasa Fiyati" carpani (0.05 -> 5); sadece TY ve PZRM kullanir
+  marketPriceMarkupPercent Decimal @default(0) @map("market_price_markup_percent") @db.Decimal(8, 3)
+  /// Kargo hesabina girmeyen kanallar (eNyeniler gibi)
+  usesCargo                Boolean @default(true) @map("uses_cargo")
+  /// Komisyon carpanlarinin uygulanip uygulanmayacagi
+  usesCommission           Boolean @default(true) @map("uses_commission")
+
+  isActive Boolean @default(true) @map("is_active")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("marketplace_settings")
+}
+
+/// Hesaplanmis pazar yeri fiyatlari (turetilmis veri / onbellek).
+model VariantPrice {
+  id        Int            @id @default(autoincrement())
+  variantId Int            @map("variant_id")
+  variant   ProductVariant @relation(fields: [variantId], references: [id], onDelete: Cascade)
+
+  marketplace Marketplace
+
+  costTry                Decimal  @map("cost_try") @db.Decimal(16, 6)
+  packagingCost          Decimal  @default(0) @map("packaging_cost") @db.Decimal(16, 6)
+  profitAmount           Decimal  @map("profit_amount") @db.Decimal(16, 6)
+  lossAmount             Decimal  @map("loss_amount") @db.Decimal(16, 6)
+  /// Excel "Paketleme Dahil Hedef Satis Fiyati" (P kolonu)
+  targetRevenue          Decimal  @map("target_revenue") @db.Decimal(16, 6)
+  cargoCost              Decimal  @map("cargo_cost") @db.Decimal(16, 6)
+  /// UPPER = barem ustu kargo, LOWER = barem alti kargo, NONE = kargo yok
+  cargoTier              String   @default("NONE") @map("cargo_tier")
+  sellerPaysCargo        Boolean  @map("seller_pays_cargo")
+  totalCommissionPercent Decimal  @map("total_commission_percent") @db.Decimal(8, 4)
+  commissionAmount       Decimal  @map("commission_amount") @db.Decimal(16, 6)
+  salePrice              Decimal  @map("sale_price") @db.Decimal(16, 6)
+  /// TY / PZRM "Piyasa Fiyati" (ustu cizili liste fiyati)
+  marketPrice            Decimal? @map("market_price") @db.Decimal(16, 6)
+  /// Kargo ve komisyon dusuldukten sonra kasaya kalan (Excel "Hakedis")
+  payoutAmount           Decimal  @default(0) @map("payout_amount") @db.Decimal(16, 6)
+
+  exchangeRateUsed Decimal @map("exchange_rate_used") @db.Decimal(12, 4)
+
+  syncStatus    SyncStatus @default(PENDING) @map("sync_status")
+  syncedAt      DateTime?  @map("synced_at")
+  lastSyncError String?    @map("last_sync_error")
+
+  calculatedAt DateTime @default(now()) @map("calculated_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  @@unique([variantId, marketplace])
+  @@index([syncStatus])
+  @@map("variant_prices")
+}
+
+/// Her stok degisiminin denetim izi.
+model StockMovement {
+  id        Int            @id @default(autoincrement())
+  variantId Int            @map("variant_id")
+  variant   ProductVariant @relation(fields: [variantId], references: [id], onDelete: Cascade)
+
+  type           StockMovementType
+  quantityChange Int               @map("quantity_change")
+  quantityAfter  Int               @map("quantity_after")
+
+  /// Siparis no, barkod, kullanici vb.
+  reference String?
+  operator  String?
+  note      String?
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([variantId, createdAt])
+  @@index([type])
+  @@map("stock_movements")
+}
+
+/// Sentos'a giden her istegin kaydi (rate limit / hata analizi).
+model SentosSyncLog {
+  id Int @id @default(autoincrement())
+
+  jobType     String       @map("job_type") // PRICE_PUSH | STOCK_PUSH | STOCK_PULL
+  entityType  String       @map("entity_type") // VARIANT
+  entityId    Int?         @map("entity_id")
+  marketplace Marketplace?
+
+  payload      Json?
+  status       SyncStatus @default(PENDING)
+  httpStatus   Int?       @map("http_status")
+  responseBody String?    @map("response_body")
+  attempt      Int        @default(1)
+  durationMs   Int?       @map("duration_ms")
+  error        String?
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([jobType, status])
+  @@index([createdAt])
+  @@map("sentos_sync_logs")
+}
+
+/// Sentos webhook idempotency kaydi.
+model WebhookEvent {
+  id Int @id @default(autoincrement())
+
+  source     String @default("SENTOS")
+  eventType  String @map("event_type")
+  externalId String @map("external_id")
+
+  payload     Json
+  status      WebhookStatus @default(RECEIVED)
+  error       String?
+  processedAt DateTime?     @map("processed_at")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@unique([source, eventType, externalId])
+  @@map("webhook_events")
+}
+
+/// Sentos'tan cekilen siparisler (salt okunur kopya; Sentos'a geri yazilmaz).
+model SentosOrder {
+  id Int @id @default(autoincrement())
+
+  /// Sentos'un kendi siparis ID'si (GET /orders/{id})
+  sentosId        Int     @unique @map("sentos_id")
+  /// Pazar yerindeki siparis no
+  platformOrderId String? @map("platform_order_id")
+  orderCode       String? @map("order_code")
+  packageCode     String? @map("package_code")
+
+  /// 1 Onay Bekliyor, 2 Onaylandi, 3 Tedarik, 4 Hazirlaniyor, 5 Kargoda, 6 Iptal, 99 Teslim
+  status          Int
+  statusChangedAt DateTime? @map("status_changed_at")
+
+  /// Pazar yeri (Trendyol, N11, ...)
+  source    String?
+  shop      String?
+  orderType String? @map("order_type")
+
+  orderDate   DateTime? @map("order_date")
+  shipDueDate DateTime? @map("ship_due_date")
+
+  total         Decimal @default(0) @db.Decimal(14, 2)
+  shippingTotal Decimal @default(0) @map("shipping_total") @db.Decimal(14, 2)
+
+  customerName  String? @map("customer_name")
+  customerPhone String? @map("customer_phone")
+  customerEmail String? @map("customer_email")
+  city          String?
+  district      String?
+
+  shipmentAddress Json? @map("shipment_address")
+  invoiceAddress  Json? @map("invoice_address")
+
+  cargoProvider String? @map("cargo_provider")
+  cargoNumber   String? @map("cargo_number")
+  trackingLink  String? @map("tracking_link")
+  hasInvoice    Boolean @default(false) @map("has_invoice")
+  invoiceNumber String? @map("invoice_number")
+  invoiceUrl    String? @map("invoice_url")
+  paymentMethod String? @map("payment_method")
+  paymentStatus String? @map("payment_status")
+  note          String?
+
+  /// Sentos'tan gelen ham yanit (eksik alan kalmasin diye saklanir)
+  raw Json
+
+  sentosCreatedAt DateTime? @map("sentos_created_at")
+  firstSeenAt     DateTime  @default(now()) @map("first_seen_at")
+  lastSyncedAt    DateTime  @default(now()) @map("last_synced_at")
+
+  lines SentosOrderLine[]
+
+  @@index([status])
+  @@index([source])
+  @@index([orderDate])
+  @@index([orderCode])
+  @@map("sentos_orders")
+}
+
+model SentosOrderLine {
+  id      Int         @id @default(autoincrement())
+  orderId Int         @map("order_id")
+  order   SentosOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  sentosLineId String? @map("sentos_line_id")
+  sku          String?
+  barcode      String?
+  name         String?
+  color        String?
+  size         String?
+  lineStatus   String? @map("line_status")
+
+  quantity  Int     @default(1)
+  listPrice Decimal @default(0) @map("list_price") @db.Decimal(14, 2)
+  price     Decimal @default(0) @db.Decimal(14, 2)
+  discount  Decimal @default(0) @db.Decimal(14, 2)
+  amount    Decimal @default(0) @db.Decimal(14, 2)
+  vatRate   Int?    @map("vat_rate")
+  imageUrl  String? @map("image_url")
+
+  /// Lokal varyant eslesmesi (SKU -> barkod). Eslesmezse bos kalir.
+  variantId Int?            @map("variant_id")
+  variant   ProductVariant? @relation(fields: [variantId], references: [id], onDelete: SetNull)
+
+  @@index([orderId])
+  @@index([variantId])
+  @@index([sku])
+  @@map("sentos_order_lines")
+}

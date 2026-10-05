@@ -1,0 +1,17 @@
+{
+  "name": "mso-teknoloji",
+  "version": "1.0.0",
+  "private": true,
+  "description": "MSO Teknoloji - Merkezi Pazar Yeri Fiyatlama ve WMS Sistemi",
+  "scripts": {
+    "infra:up": "docker compose up -d",
+    "infra:down": "docker compose down",
+    "setup": "npm --prefix backend install && npm --prefix frontend install && npm --prefix backend run auth:setup && npm --prefix backend run prisma:push && npm --prefix backend run seed",
+    "auth:setup": "npm --prefix backend run auth:setup",
+    "test:auth": "npm --prefix backend run test:auth",
+    "dev:api": "npm --prefix backend run dev",
+    "dev:worker": "npm --prefix backend run worker",
+    "dev:web": "npm --prefix frontend run dev",
+    "test": "npm --prefix backend run test:pricing"
+  }
+}
