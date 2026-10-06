@@ -17,6 +17,8 @@ const schema = z.object({
   ADMIN_PASSWORD_HASH: z.string().default(''),
   SESSION_HOURS: z.coerce.number().min(1).max(168).default(12),
   CORS_ORIGIN: z.string().default('*'),
+  /// Onumuzdeki guvenilir proxy sayisi (Vercel + Render = 2). Giris denemesi siniri gercek istemci IP'sini kullanir.
+  TRUST_PROXY: z.coerce.number().int().min(0).default(0),
 
   DATABASE_URL: z.string().min(1),
   REDIS_URL: z.string().default('redis://localhost:6381'),

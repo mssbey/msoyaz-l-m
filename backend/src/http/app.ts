@@ -21,6 +21,7 @@ import { authRouter } from '../modules/auth/auth.routes.js';
 
 export function createApp() {
   const app = express();
+  if (env.TRUST_PROXY > 0) app.set('trust proxy', env.TRUST_PROXY);
 
   app.use(helmet());
   app.use(

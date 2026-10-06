@@ -1,0 +1,108 @@
+# Render Blueprint: API + worker + PostgreSQL + Redis (Key Value)
+# Frontend Vercel'de calisir; /api istekleri frontend/vercel.json ile buraya yonlendirilir.
+# Gizli degerler (sync: false) repoda tutulmaz, Blueprint olusturulurken panelden girilir.
+
+databases:
+  - name: mso-db
+    databaseName: mso_wms
+    user: mso
+    plan: basic-256mb
+    region: frankfurt
+    postgresMajorVersion: "16"
+
+services:
+  - type: keyvalue
+    name: mso-redis
+    plan: free
+    region: frankfurt
+    # BullMQ anahtarlarin silinmemesini ister.
+    maxmemoryPolicy: noeviction
+    ipAllowList: []
+
+  - type: web
+    name: mso-teknoloji-api
+    runtime: node
+    plan: starter
+    region: frankfurt
+    rootDir: backend
+    buildCommand: npm ci --include=dev && npx prisma generate && npm run build
+    preDeployCommand: npx prisma db push --skip-generate && npm run seed
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - fromGroup: mso-shared
+      - key: DATABASE_URL
+        fromDatabase:
+          name: mso-db
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: mso-redis
+          property: connectionString
+      # Vercel rewrite + Render proxy
+      - key: TRUST_PROXY
+        value: "2"
+      - key: CORS_ORIGIN
+        value: https://mso-teknoloji.vercel.app
+      - key: ADMIN_PASSWORD_HASH
+        sync: false
+      - key: SENTOS_API_KEY
+        sync: false
+      - key: SENTOS_API_SECRET
+        sync: false
+      - key: SENTOS_WEBHOOK_SECRET
+        sync: false
+
+  - type: worker
+    name: mso-teknoloji-worker
+    runtime: node
+    plan: starter
+    region: frankfurt
+    rootDir: backend
+    buildCommand: npm ci --include=dev && npx prisma generate && npm run build
+    startCommand: npm run start:worker
+    envVars:
+      - fromGroup: mso-shared
+      - key: DATABASE_URL
+        fromDatabase:
+          name: mso-db
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: mso-redis
+          property: connectionString
+      - key: SENTOS_API_KEY
+        sync: false
+      - key: SENTOS_API_SECRET
+        sync: false
+
+envVarGroups:
+  - name: mso-shared
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: NODE_VERSION
+        value: "22"
+      - key: LOG_LEVEL
+        value: info
+      - key: TZ
+        value: Europe/Istanbul
+      - key: ADMIN_USERNAME
+        value: admin
+      - key: ADMIN_API_KEY
+        generateValue: true
+      - key: TERMINAL_API_KEY
+        generateValue: true
+      - key: QUEUE_PREFIX
+        value: mso
+      - key: SENTOS_BASE_URL
+        value: https://msoteknoloji.sentos.com.tr/api
+      # Canli Sentos yazimini acmak icin panelden false yapin.
+      - key: SENTOS_DRY_RUN
+        value: "true"
+      - key: SENTOS_PRICE_PUSH_ENABLED
+        value: "false"
+      - key: CRON_ENABLED
+        value: "true"
